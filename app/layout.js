@@ -208,6 +208,102 @@ export default function RootLayout({ children }) {
               0%, 100% { opacity: 1; transform: scale(1); }
               50% { opacity: 0.85; transform: scale(1.03); }
             }
+
+            @keyframes liveSyncGlow {
+              0%, 100% { box-shadow: 0 0 10px rgba(45, 212, 191, 0.4); }
+              50% { box-shadow: 0 0 22px rgba(45, 212, 191, 0.8); }
+            }
+
+            .sync-pulse {
+              animation: liveSyncGlow 2.5s infinite ease-in-out;
+            }
+
+            /* ── Professional Printing Styles for Thermal 80mm/58mm, A4, and Labels ── */
+            @media screen {
+              .print-only {
+                display: none !important;
+              }
+            }
+
+            @media print {
+              html, body {
+                background: #ffffff !important;
+                color: #000000 !important;
+                margin: 0 !important;
+                padding: 0 !important;
+                -webkit-print-color-adjust: exact !important;
+                print-color-adjust: exact !important;
+              }
+
+              /* Hide all web application chrome */
+              header, nav, .no-print, .aurora-container, .toast, button, input, select {
+                display: none !important;
+              }
+
+              .print-only {
+                display: block !important;
+                position: static !important;
+              }
+
+              .print-area-wrapper {
+                width: 100% !important;
+                margin: 0 !important;
+                padding: 0 !important;
+                background: #ffffff !important;
+                color: #000000 !important;
+              }
+
+              /* 80mm Standard POS Thermal Receipt */
+              .receipt-80mm {
+                width: 76mm !important;
+                margin: 0 auto !important;
+                padding: 3mm 1mm !important;
+                font-family: 'Courier New', Courier, monospace !important;
+                font-size: 11px !important;
+                line-height: 1.35 !important;
+                color: #000000 !important;
+                background: #ffffff !important;
+              }
+
+              /* 58mm Mobile Bluetooth Sunmi Receipt */
+              .receipt-58mm {
+                width: 52mm !important;
+                margin: 0 auto !important;
+                padding: 2mm 0mm !important;
+                font-family: 'Courier New', Courier, monospace !important;
+                font-size: 9.5px !important;
+                line-height: 1.25 !important;
+                color: #000000 !important;
+                background: #ffffff !important;
+              }
+
+              /* A4 Tax Invoice / Wholesale Dispatch */
+              .invoice-a4 {
+                width: 100% !important;
+                max-width: 200mm !important;
+                margin: 0 auto !important;
+                padding: 8mm !important;
+                font-family: 'Plus Jakarta Sans', system-ui, sans-serif !important;
+                font-size: 12px !important;
+                color: #000000 !important;
+                background: #ffffff !important;
+              }
+
+              /* Barcode Shelf Labels Sheet */
+              .labels-sheet {
+                display: grid !important;
+                grid-template-columns: repeat(3, 1fr) !important;
+                gap: 5mm !important;
+                width: 100% !important;
+                padding: 5mm !important;
+                background: #ffffff !important;
+              }
+
+              @page {
+                margin: 0;
+                size: auto;
+              }
+            }
           `
         }} />
       </head>

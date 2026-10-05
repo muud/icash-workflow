@@ -254,7 +254,7 @@ export default function Page() {
       <main style={styles.main}>
         {tab === "inbox" && <InboxView flash={flash} user={user} t={t} />}
         {tab === "requests" && <RequestsView flash={flash} t={t} />}
-        {tab === "pos" && <PosView flash={flash} user={user} t={t} />}
+        {tab === "pos" && <PosView flash={flash} user={user} t={t} lang={lang} />}
         {tab === "stock" && <StockView flash={flash} user={user} hasRole={hasRole} t={t} />}
         {tab === "receive" && <ReceiveView flash={flash} t={t} />}
         {tab === "closeout" && <CloseoutView flash={flash} hasRole={hasRole} t={t} />}
@@ -934,53 +934,302 @@ function RequestsView({ flash }) {
   );
 }
 
-// ── 3. Sell / POS ────────────────────────────────────────────────────
-function PosView({ flash }) {
+// ── Audio Synthesis for POS (No external audio files needed) ─────────
+function playPosBeep(freq = 880, duration = 0.08) {
+  try {
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    if (!AudioCtx) return;
+    const ctx = new AudioCtx();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.frequency.value = freq;
+    osc.type = "sine";
+    gain.gain.setValueAtTime(0.12, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + duration);
+    osc.start();
+    osc.stop(ctx.currentTime + duration);
+  } catch {}
+}
+
+function playPosCashChime() {
+  try {
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    if (!AudioCtx) return;
+    const ctx = new AudioCtx();
+    const notes = [523.25, 659.25, 783.99, 1046.5];
+    notes.forEach((freq, idx) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.frequency.value = freq;
+      osc.type = "triangle";
+      const start = ctx.currentTime + idx * 0.07;
+      gain.gain.setValueAtTime(0.14, start);
+      gain.gain.exponentialRampToValueAtTime(0.001, start + 0.22);
+      osc.start(start);
+      osc.stop(start + 0.22);
+    });
+  } catch {}
+}
+
+// ── 3. Touch Screen POS & All Print System (Multi-Device) ─────────────
+function PosView({ flash, user, t, lang = "so" }) {
   const [products, setProducts] = useState([]);
   const [customers, setCustomers] = useState([]);
-  const [cart, setCart] = useState([]);
+  
+  // Multi-cart state: 3 independent customer carts
+  const [carts, setCarts] = useState([[], [], []]);
+  const [activeCartIdx, setActiveCartIdx] = useState(0);
+  const cart = carts[activeCartIdx] || [];
+
+  // Station / Till identity
+  const [station, setStation] = useState("Till 1 (Main Cashier)");
+  const [showStationPicker, setShowStationPicker] = useState(false);
+
+  // Manual & Touch Add State
   const [selectedPid, setSelectedPid] = useState("");
   const [qty, setQty] = useState(1);
   const [customerId, setCustomerId] = useState("");
   const [method, setMethod] = useState("cash");
   const [reference, setReference] = useState("");
-  const [lastReceipt, setLastReceipt] = useState(null);
 
-  const loadPos = async () => {
+  // Touch Numpad & Quick Tender
+  const [tendered, setTendered] = useState("");
+  const [showNumpad, setShowNumpad] = useState(true);
+
+  // Filter & Search
+  const [searchQuery, setSearchQuery] = useState("");
+  const [categoryFilter, setCategoryFilter] = useState("all");
+  const [barcodeInput, setBarcodeInput] = useState("");
+
+  // Printing & Receipt Modal
+  const [lastReceipt, setLastReceipt] = useState(null);
+  const [printModalOpen, setPrintModalOpen] = useState(false);
+  const [printFormat, setPrintFormat] = useState("thermal80"); // thermal80 | thermal58 | dispatch | labels | invoiceA4
+  const [autoPrint, setAutoPrint] = useState(true);
+  const [soundEnabled, setSoundEnabled] = useState(true);
+
+  // Multi-Device Wi-Fi Hub
+  const [showDeviceHub, setShowDeviceHub] = useState(false);
+  const [syncNotice, setSyncNotice] = useState(null);
+  const [lastSyncTime, setLastSyncTime] = useState(Date.now());
+
+  // Load Station and Settings from LocalStorage
+  useEffect(() => {
+    try {
+      const savedStation = localStorage.getItem("icash_pos_station");
+      if (savedStation) setStation(savedStation);
+      const savedAutoPrint = localStorage.getItem("icash_autoprint");
+      if (savedAutoPrint !== null) setAutoPrint(savedAutoPrint === "true");
+    } catch {}
+  }, []);
+
+  const changeStation = (newStation) => {
+    setStation(newStation);
+    setShowStationPicker(false);
+    try {
+      localStorage.setItem("icash_pos_station", newStation);
+    } catch {}
+    flash(lang === "so" ? `Qalabka waxaa loo bedelay: ${newStation}` : `POS Station set to: ${newStation}`);
+  };
+
+  const loadPos = async (silent = false) => {
     try {
       const [prods, custs] = await Promise.all([api.pos.getProducts(), api.pos.getCustomers()]);
       setProducts(prods);
       setCustomers(custs);
+      setLastSyncTime(Date.now());
       if (prods.length > 0 && !selectedPid) setSelectedPid(prods[0].id);
     } catch (err) {
-      flash(err.message, true);
+      if (!silent) flash(err.message, true);
     }
   };
 
+  // Initial load
   useEffect(() => {
     loadPos();
   }, []);
 
-  const addToCart = () => {
-    const prod = products.find((p) => p.id === Number(selectedPid));
-    if (!prod) return;
-    const q = Number(qty);
-    if (!q || q <= 0) return flash("Quantity must be greater than zero.", true);
+  // Multi-Device Cross-Tab & Cross-Device Live Sync
+  useEffect(() => {
+    let bc;
+    try {
+      bc = new BroadcastChannel("icash_pos_sync");
+      bc.onmessage = (event) => {
+        if (event.data?.type === "SALE_COMPLETED") {
+          loadPos(true);
+          setSyncNotice(
+            lang === "so"
+              ? `⚡ Xogta waa la cusbooneysiiyay: Iib #${event.data.saleId} oo ka dhacay ${event.data.station}`
+              : `⚡ Real-time Sync: Sale #${event.data.saleId} completed at ${event.data.station}`
+          );
+          setTimeout(() => setSyncNotice(null), 4000);
+        }
+      };
+    } catch {}
 
+    // Background polling every 4.5s for devices across local Wi-Fi network
+    const timer = setInterval(() => {
+      loadPos(true);
+    }, 4500);
+
+    return () => {
+      try { bc?.close(); } catch {}
+      clearInterval(timer);
+    };
+  }, [lang]);
+
+  // Barcode Scanner Listener (Hardware USB & Bluetooth barcode guns)
+  useEffect(() => {
+    let buffer = "";
+    let lastKeyTime = Date.now();
+
+    const handleKeyDown = (e) => {
+      // Don't intercept if user is typing in regular text inputs other than barcode box
+      const targetTag = e.target.tagName;
+      if (targetTag === "INPUT" && e.target.id !== "barcode-scan-input") {
+        return;
+      }
+      if (targetTag === "TEXTAREA" || targetTag === "SELECT") {
+        return;
+      }
+
+      const currentTime = Date.now();
+      if (currentTime - lastKeyTime > 70) {
+        buffer = "";
+      }
+      lastKeyTime = currentTime;
+
+      if (e.key === "Enter" && buffer.trim().length > 1) {
+        e.preventDefault();
+        handleBarcodeMatch(buffer.trim());
+        buffer = "";
+      } else if (e.key.length === 1) {
+        buffer += e.key;
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  });
+
+  const handleBarcodeMatch = (code) => {
+    const clean = code.trim().toLowerCase();
+    const found = products.find(
+      (p) =>
+        (p.sku && p.sku.toLowerCase() === clean) ||
+        p.name.toLowerCase().includes(clean) ||
+        String(p.id) === clean
+    );
+
+    if (found) {
+      if (soundEnabled) playPosBeep(980, 0.09);
+      quickAddProduct(found);
+      flash(lang === "so" ? `Baarkoodh: ${found.name} waa lagu daray!` : `Scanned: ${found.name} added!`);
+      setBarcodeInput("");
+    } else {
+      if (soundEnabled) playPosBeep(320, 0.15);
+      flash(lang === "so" ? `Lama helin badeeco baarkoodhkeedu yahay "${code}".` : `No product found for barcode "${code}".`, true);
+    }
+  };
+
+  // Cart operations for active cart
+  const updateActiveCart = (newCart) => {
+    setCarts((prev) => {
+      const copy = [...prev];
+      copy[activeCartIdx] = newCart;
+      return copy;
+    });
+  };
+
+  const quickAddProduct = (prod) => {
+    if (prod.sellable <= 0) {
+      if (soundEnabled) playPosBeep(300, 0.12);
+      return flash(`${prod.name} bakhaarka kama buuxdo (Out of stock).`, true);
+    }
     const existing = cart.find((l) => l.product_id === prod.id);
-    const totalQty = (existing ? existing.qty : 0) + q;
+    const totalQty = (existing ? existing.qty : 0) + 1;
     if (totalQty > prod.sellable) {
-      return flash(`Cannot exceed available sellable stock (${prod.sellable} ${prod.unit}).`, true);
+      return flash(`Tirada kama badnaan karto alaabta jirta (${prod.sellable} ${prod.unit}).`, true);
     }
 
+    if (soundEnabled) playPosBeep(880, 0.06);
+
     if (existing) {
-      setCart(cart.map((l) => (l.product_id === prod.id ? { ...l, qty: totalQty } : l)));
+      updateActiveCart(cart.map((l) => (l.product_id === prod.id ? { ...l, qty: totalQty } : l)));
     } else {
-      setCart([
+      updateActiveCart([
         ...cart,
         {
           product_id: prod.id,
           name: prod.name,
+          sku: prod.sku || `SKU-${prod.id}`,
+          unit: prod.unit,
+          qty: 1,
+          price: prod.sell_price,
+        },
+      ]);
+    }
+  };
+
+  const updateCartQty = (pid, delta) => {
+    const prod = products.find((p) => p.id === pid);
+    if (!prod) return;
+    const updated = cart
+      .map((item) => {
+        if (item.product_id !== pid) return item;
+        const newQty = Math.round((item.qty + delta) * 1000) / 1000;
+        if (newQty <= 0) return null;
+        if (newQty > prod.sellable) {
+          flash(`Kama badnaan karto alaabta jirta (${prod.sellable} ${prod.unit}).`, true);
+          return item;
+        }
+        return { ...item, qty: newQty };
+      })
+      .filter(Boolean);
+
+    if (soundEnabled) playPosBeep(750, 0.05);
+    updateActiveCart(updated);
+  };
+
+  const removeFromCart = (pid) => {
+    if (soundEnabled) playPosBeep(440, 0.08);
+    updateActiveCart(cart.filter((l) => l.product_id !== pid));
+  };
+
+  const clearCurrentCart = () => {
+    if (cart.length === 0) return;
+    updateActiveCart([]);
+    setTendered("");
+    flash(lang === "so" ? "Qasnadda hadda waa la banneeyay." : "Current cart cleared.");
+  };
+
+  const addToCartManual = () => {
+    const prod = products.find((p) => p.id === Number(selectedPid));
+    if (!prod) return;
+    const q = Number(qty);
+    if (!q || q <= 0) return flash("Tiradu waa inay ka weynaato eber.", true);
+
+    const existing = cart.find((l) => l.product_id === prod.id);
+    const totalQty = (existing ? existing.qty : 0) + q;
+    if (totalQty > prod.sellable) {
+      return flash(`Kama badnaan karto alaabta jirta (${prod.sellable} ${prod.unit}).`, true);
+    }
+
+    if (soundEnabled) playPosBeep(880, 0.06);
+
+    if (existing) {
+      updateActiveCart(cart.map((l) => (l.product_id === prod.id ? { ...l, qty: totalQty } : l)));
+    } else {
+      updateActiveCart([
+        ...cart,
+        {
+          product_id: prod.id,
+          name: prod.name,
+          sku: prod.sku || `SKU-${prod.id}`,
           unit: prod.unit,
           qty: q,
           price: prod.sell_price,
@@ -990,61 +1239,49 @@ function PosView({ flash }) {
     setQty(1);
   };
 
-  const updateCartQty = (pid, delta) => {
-    const prod = products.find((p) => p.id === pid);
-    if (!prod) return;
-    setCart((prev) =>
-      prev
-        .map((item) => {
-          if (item.product_id !== pid) return item;
-          const newQty = Math.round((item.qty + delta) * 1000) / 1000;
-          if (newQty <= 0) return null;
-          if (newQty > prod.sellable) {
-            flash(`Cannot exceed available stock (${prod.sellable} ${prod.unit}).`, true);
-            return item;
-          }
-          return { ...item, qty: newQty };
-        })
-        .filter(Boolean)
-    );
-  };
-
-  const quickAddProduct = (prod) => {
-    if (prod.sellable <= 0) return flash(`${prod.name} is out of stock.`, true);
-    const existing = cart.find((l) => l.product_id === prod.id);
-    const totalQty = (existing ? existing.qty : 0) + 1;
-    if (totalQty > prod.sellable) {
-      return flash(`Cannot exceed available stock (${prod.sellable} ${prod.unit}).`, true);
-    }
-    if (existing) {
-      setCart(cart.map((l) => (l.product_id === prod.id ? { ...l, qty: totalQty } : l)));
-    } else {
-      setCart([
-        ...cart,
-        {
-          product_id: prod.id,
-          name: prod.name,
-          unit: prod.unit,
-          qty: 1,
-          price: prod.sell_price,
-        },
-      ]);
-    }
-  };
-
-  const removeFromCart = (pid) => {
-    setCart(cart.filter((l) => l.product_id !== pid));
-  };
-
   const totalAmount = useMemo(
     () => cart.reduce((sum, item) => sum + item.qty * item.price, 0),
     [cart]
   );
 
+  // Live change calculations
+  const numTendered = Number(tendered) || 0;
+  const changeDue = Math.max(0, numTendered - totalAmount);
+  const remainingDue = Math.max(0, totalAmount - numTendered);
+
+  // Numpad key tap
+  const handleNumpadPress = (char) => {
+    if (soundEnabled) playPosBeep(620, 0.03);
+    if (char === "C") {
+      setTendered("");
+    } else if (char === "BACK") {
+      setTendered((prev) => prev.slice(0, -1));
+    } else if (char === ".") {
+      if (!tendered.includes(".")) setTendered((prev) => (prev ? prev + "." : "0."));
+    } else {
+      setTendered((prev) => prev + char);
+    }
+  };
+
+  const addQuickPreset = (amount) => {
+    if (soundEnabled) playPosBeep(700, 0.04);
+    if (amount === "EXACT") {
+      setTendered(String(totalAmount));
+    } else {
+      setTendered((prev) => String((Number(prev) || 0) + amount));
+    }
+  };
+
+  // Complete checkout
   const handleCheckout = async () => {
-    if (cart.length === 0) return flash("Sale cart is empty.", true);
+    if (cart.length === 0) return flash(lang === "so" ? "Qasnadda hadda waxba kuma jiraan." : "Sale cart is empty.", true);
     if (method !== "cash" && !reference.trim()) {
-      return flash("Please enter M-Pesa transaction code or card reference slip.", true);
+      return flash(
+        lang === "so"
+          ? "Fadlan geli koodhka fariinta M-Pesa/EVC ama lambarka kaadhka."
+          : "Please enter transaction reference or card slip number.",
+        true
+      );
     }
 
     try {
@@ -1054,239 +1291,1638 @@ function PosView({ flash }) {
         reference: reference.trim() || null,
         lines: cart.map((l) => ({ product_id: l.product_id, qty: l.qty })),
       };
-      const res = await api.pos.sell(payload);
-      flash(`Sale #${res.id} completed! Total: KES ${money(res.total)}`);
 
-      setLastReceipt({
+      const res = await api.pos.sell(payload);
+      if (soundEnabled) playPosCashChime();
+
+      // Broadcast sale completion across all browser tabs & network clients
+      try {
+        const bc = new BroadcastChannel("icash_pos_sync");
+        bc.postMessage({
+          type: "SALE_COMPLETED",
+          saleId: res.id,
+          station,
+          timestamp: Date.now(),
+        });
+        bc.close();
+      } catch {}
+
+      const custObj = customers.find((c) => c.id === Number(customerId));
+      const receiptObj = {
         id: res.id,
         total: res.total,
         cart: [...cart],
         method,
-        reference,
-        date: new Date().toLocaleString("en-KE"),
-      });
+        reference: reference.trim(),
+        station,
+        cashier: user?.full_name || "iCash Cashier",
+        customer: custObj ? custObj.name : (lang === "so" ? "Macmiil Caadi ah" : "Walk-in Customer"),
+        customerPhone: custObj?.phone || "",
+        tendered: numTendered > 0 ? numTendered : res.total,
+        change: changeDue,
+        date: new Date().toLocaleString(lang === "so" ? "so-SO" : "en-KE"),
+        timestamp: new Date().toISOString(),
+      };
 
-      setCart([]);
+      setLastReceipt(receiptObj);
+      setPrintModalOpen(true);
+
+      // Auto-Print trigger
+      if (autoPrint) {
+        setTimeout(() => {
+          window.print();
+        }, 350);
+      }
+
+      // Clear current cart and reset inputs
+      updateActiveCart([]);
+      setTendered("");
       setReference("");
-      loadPos();
+      loadPos(true);
+      flash(
+        lang === "so"
+          ? `Iib #${res.id} waa la dhammaystiray! Wadarta: KES ${money(res.total)}`
+          : `Sale #${res.id} completed successfully! Total: KES ${money(res.total)}`
+      );
     } catch (err) {
       flash(err.message, true);
     }
   };
 
+  // Product categories filtering
+  const filteredProducts = products.filter((p) => {
+    const matchesSearch =
+      searchQuery === "" ||
+      p.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
+      (p.sku && p.sku.toLowerCase().includes(searchQuery.toLowerCase()));
+
+    if (!matchesSearch) return false;
+    if (categoryFilter === "all") return true;
+    if (categoryFilter === "grains") return p.name.toLowerCase().includes("rice") || p.name.toLowerCase().includes("bariis") || p.name.toLowerCase().includes("sugar") || p.name.toLowerCase().includes("sonkor");
+    if (categoryFilter === "oils") return p.name.toLowerCase().includes("oil") || p.name.toLowerCase().includes("saliid") || p.name.toLowerCase().includes("pasta") || p.name.toLowerCase().includes("baasto");
+    if (categoryFilter === "beverages") return p.name.toLowerCase().includes("milk") || p.name.toLowerCase().includes("caano") || p.name.toLowerCase().includes("water") || p.name.toLowerCase().includes("biyo");
+    return true;
+  });
+
+  const triggerDirectPrint = (format) => {
+    setPrintFormat(format);
+    setTimeout(() => {
+      window.print();
+    }, 150);
+  };
+
   return (
     <div>
-      <h2 style={{ margin: "0 0 16px" }}>Point of Sale (Wholesale Till)</h2>
-
-      {/* Quick Touch Product Grid */}
-      <div style={{ ...styles.card, marginBottom: 14 }}>
-        <strong style={{ fontSize: 15, color: "#ffffff", fontFamily: "'Outfit', sans-serif" }}>
-          ⚡ Quick Tap Products (Touch Screen Till)
-        </strong>
-        <div style={styles.productGrid} className="pos-grid-responsive">
-          {products.map((p) => (
+      {/* Real-time Sync & Live Station Status Bar */}
+      <div
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          flexWrap: "wrap",
+          gap: 10,
+          background: "rgba(15, 23, 42, 0.65)",
+          backdropFilter: "blur(18px)",
+          padding: "10px 16px",
+          borderRadius: 14,
+          border: "1px solid rgba(255, 255, 255, 0.1)",
+          marginBottom: 16,
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+          {/* Active Station Badge & Selector */}
+          <div style={{ position: "relative" }}>
             <button
-              key={p.id}
               type="button"
-              className="touch-btn glass-hover"
+              className="touch-btn sync-pulse"
+              onClick={() => setShowStationPicker(!showStationPicker)}
               style={{
-                ...styles.productTile,
-                opacity: p.sellable > 0 ? 1 : 0.45,
+                background: "linear-gradient(135deg, rgba(13, 148, 136, 0.3) 0%, rgba(20, 184, 166, 0.5) 100%)",
+                border: "1px solid rgba(45, 212, 191, 0.5)",
+                color: "#2dd4bf",
+                borderRadius: 10,
+                padding: "6px 12px",
+                fontSize: 12,
+                fontWeight: 800,
+                cursor: "pointer",
+                display: "inline-flex",
+                alignItems: "center",
+                gap: 6,
               }}
-              onClick={() => quickAddProduct(p)}
             >
-              <div>
-                <strong style={{ fontSize: 13, color: "#ffffff", display: "block", lineHeight: 1.3 }}>{p.name}</strong>
-                <span style={{ fontSize: 11, color: "#94a3b8", marginTop: 2, display: "inline-block" }}>
-                  {p.sellable} {p.unit} left
-                </span>
-              </div>
-              <div style={{ marginTop: 6, fontWeight: 800, color: "#2dd4bf", fontSize: 14 }}>
-                KES {money(p.sell_price)}
-              </div>
+              <span style={{ width: 8, height: 8, borderRadius: "50%", background: "#10b981", display: "inline-block" }}></span>
+              <span>{station}</span>
+              <span style={{ fontSize: 10, opacity: 0.7 }}>▼</span>
             </button>
-          ))}
+
+            {showStationPicker && (
+              <div
+                style={{
+                  position: "absolute",
+                  top: "100%",
+                  left: 0,
+                  marginTop: 6,
+                  zIndex: 999,
+                  background: "#0b1220",
+                  border: "1px solid rgba(255, 255, 255, 0.2)",
+                  borderRadius: 12,
+                  padding: 6,
+                  boxShadow: "0 18px 40px rgba(0,0,0,0.7)",
+                  minWidth: 220,
+                }}
+              >
+                <div style={{ padding: "6px 10px", fontSize: 11, color: "#94a3b8", fontWeight: 700, textTransform: "uppercase" }}>
+                  {lang === "so" ? "Dooro Qalabkaaga" : "Select Register"}
+                </div>
+                {[
+                  "🖥️ Till 1 (Main Cashier)",
+                  "💻 Till 2 (Counter Express)",
+                  "📱 Tablet 1 (Floor Sales)",
+                  "📦 Warehouse (Stock Dispatch)",
+                  "🛒 Mobile POS 1",
+                ].map((s) => (
+                  <button
+                    key={s}
+                    type="button"
+                    className="touch-btn"
+                    onClick={() => changeStation(s)}
+                    style={{
+                      width: "100%",
+                      textAlign: "left",
+                      padding: "8px 12px",
+                      background: station === s ? "rgba(20, 184, 166, 0.25)" : "transparent",
+                      color: station === s ? "#2dd4bf" : "#e2e8f0",
+                      border: "none",
+                      borderRadius: 8,
+                      fontSize: 12,
+                      fontWeight: 700,
+                      cursor: "pointer",
+                      display: "block",
+                      marginBottom: 2,
+                    }}
+                  >
+                    {s}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* Live Sync Indicator */}
+          <div style={{ display: "inline-flex", alignItems: "center", gap: 6, fontSize: 12, color: "#94a3b8" }}>
+            <span style={{ color: "#10b981" }}>●</span>
+            <span>{lang === "so" ? "Isku-Xir Toos ah (Live Sync Active)" : "Multi-Device Live Sync Active"}</span>
+          </div>
+
+          {syncNotice && (
+            <div style={{ background: "rgba(16, 185, 129, 0.2)", color: "#34d399", border: "1px solid rgba(16, 185, 129, 0.4)", borderRadius: 8, padding: "4px 10px", fontSize: 11, fontWeight: 700 }}>
+              {syncNotice}
+            </div>
+          )}
+        </div>
+
+        {/* Action Controls: Multi-Device Hub, Sound, Auto-Print */}
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          {/* Sound Toggle */}
+          <button
+            type="button"
+            className="touch-btn"
+            onClick={() => setSoundEnabled(!soundEnabled)}
+            title={soundEnabled ? "Sound ON" : "Sound OFF"}
+            style={{
+              background: soundEnabled ? "rgba(20, 184, 166, 0.2)" : "rgba(255,255,255,0.05)",
+              color: soundEnabled ? "#2dd4bf" : "#94a3b8",
+              border: "1px solid rgba(255,255,255,0.12)",
+              borderRadius: 9,
+              padding: "6px 10px",
+              fontSize: 12,
+              cursor: "pointer",
+            }}
+          >
+            {soundEnabled ? "🔊 Beep ON" : "🔇 Beep OFF"}
+          </button>
+
+          {/* Auto Print Toggle */}
+          <button
+            type="button"
+            className="touch-btn"
+            onClick={() => {
+              const val = !autoPrint;
+              setAutoPrint(val);
+              try { localStorage.setItem("icash_autoprint", String(val)); } catch {}
+            }}
+            style={{
+              background: autoPrint ? "rgba(20, 184, 166, 0.2)" : "rgba(255,255,255,0.05)",
+              color: autoPrint ? "#2dd4bf" : "#94a3b8",
+              border: "1px solid rgba(255,255,255,0.12)",
+              borderRadius: 9,
+              padding: "6px 10px",
+              fontSize: 12,
+              cursor: "pointer",
+              display: "inline-flex",
+              alignItems: "center",
+              gap: 5,
+            }}
+          >
+            <span>🖨️</span>
+            <span>{autoPrint ? "Auto-Print ON" : "Auto-Print OFF"}</span>
+          </button>
+
+          {/* Connect Other Devices / Wi-Fi LAN Hub */}
+          <button
+            type="button"
+            className="touch-btn"
+            onClick={() => setShowDeviceHub(true)}
+            style={{
+              background: "linear-gradient(135deg, #0284c7 0%, #0369a1 100%)",
+              color: "#ffffff",
+              border: "none",
+              borderRadius: 9,
+              padding: "6px 12px",
+              fontSize: 12,
+              fontWeight: 800,
+              cursor: "pointer",
+              display: "inline-flex",
+              alignItems: "center",
+              gap: 6,
+              boxShadow: "0 2px 10px rgba(2, 132, 199, 0.3)",
+            }}
+          >
+            <span>📲</span>
+            <span>{lang === "so" ? "Ku Xir Qalab Kale" : "Connect Devices"}</span>
+          </button>
         </div>
       </div>
 
-      <div style={styles.gridTwo} className="grid-two-responsive">
-        {/* Add Product by Quantity */}
-        <div style={styles.card}>
-          <strong style={{ fontSize: 15, color: "#ffffff", fontFamily: "'Outfit', sans-serif" }}>Manual / Bulk Add</strong>
-          <div style={{ marginTop: 12 }}>
-            <label style={styles.label}>Product</label>
-            <select
-              style={styles.input}
-              value={selectedPid}
-              onChange={(e) => setSelectedPid(e.target.value)}
-            >
-              {products.map((p) => (
-                <option key={p.id} value={p.id}>
-                  {p.name} · Available: {p.sellable} {p.unit} · KES {money(p.sell_price)}
-                </option>
-              ))}
-            </select>
+      {/* Multi-Cart Tabs (Hold / Switch Orders) */}
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12, flexWrap: "wrap", gap: 10 }}>
+        <div style={{ display: "inline-flex", background: "rgba(0,0,0,0.35)", padding: 4, borderRadius: 12, border: "1px solid rgba(255,255,255,0.1)" }}>
+          {[0, 1, 2].map((idx) => {
+            const count = carts[idx]?.length || 0;
+            const isActive = activeCartIdx === idx;
+            return (
+              <button
+                key={idx}
+                type="button"
+                className="touch-btn"
+                onClick={() => setActiveCartIdx(idx)}
+                style={{
+                  background: isActive ? "linear-gradient(135deg, #0d9488 0%, #14b8a6 100%)" : "transparent",
+                  color: isActive ? "#ffffff" : "#94a3b8",
+                  border: "none",
+                  borderRadius: 9,
+                  padding: "7px 14px",
+                  fontSize: 12,
+                  fontWeight: 800,
+                  cursor: "pointer",
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: 6,
+                  boxShadow: isActive ? "0 2px 10px rgba(13, 148, 136, 0.4)" : "none",
+                }}
+              >
+                <span>🛒 {lang === "so" ? `Dalab #${idx + 1}` : `Order #${idx + 1}`}</span>
+                {count > 0 && (
+                  <span
+                    style={{
+                      background: isActive ? "rgba(0,0,0,0.35)" : "rgba(20, 184, 166, 0.4)",
+                      color: "#fff",
+                      fontSize: 11,
+                      fontWeight: 900,
+                      padding: "1px 6px",
+                      borderRadius: 99,
+                    }}
+                  >
+                    {count}
+                  </span>
+                )}
+              </button>
+            );
+          })}
+        </div>
 
-            <label style={styles.label}>Quantity</label>
+        {/* Quick Barcode Scanner Box */}
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <div style={{ position: "relative", minWidth: 260 }}>
             <input
-              style={styles.input}
-              type="number"
-              step="any"
-              min="0.001"
-              value={qty}
-              onChange={(e) => setQty(e.target.value)}
+              id="barcode-scan-input"
+              style={{
+                ...styles.input,
+                margin: 0,
+                paddingLeft: 34,
+                fontSize: 13,
+                height: 40,
+                background: "rgba(0,0,0,0.4)",
+                borderColor: "rgba(45, 212, 191, 0.4)",
+              }}
+              placeholder={lang === "so" ? "Sawir Baarkoodh / Geli SKU..." : "Scan Barcode or enter SKU..."}
+              value={barcodeInput}
+              onChange={(e) => setBarcodeInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && barcodeInput.trim()) {
+                  e.preventDefault();
+                  handleBarcodeMatch(barcodeInput.trim());
+                }
+              }}
             />
+            <span style={{ position: "absolute", left: 10, top: "50%", transform: "translateY(-50%)", fontSize: 16 }}>
+              🏷️
+            </span>
+          </div>
+          <button
+            type="button"
+            className="touch-btn"
+            onClick={() => barcodeInput.trim() && handleBarcodeMatch(barcodeInput.trim())}
+            style={{
+              background: "rgba(20, 184, 166, 0.25)",
+              color: "#2dd4bf",
+              border: "1px solid rgba(45, 212, 191, 0.5)",
+              borderRadius: 10,
+              padding: "0 14px",
+              height: 40,
+              fontWeight: 800,
+              fontSize: 12,
+              cursor: "pointer",
+            }}
+          >
+            {lang === "so" ? "Raadi" : "Scan"}
+          </button>
+        </div>
+      </div>
 
-            <button style={{ ...styles.btnGhost, width: "100%", marginTop: 14 }} className="touch-btn" onClick={addToCart}>
-              + Add to Sale Cart
-            </button>
+      {/* Main Touch POS Grid & Cart Section */}
+      <div style={{ display: "grid", gridTemplateColumns: "1.25fr 0.95fr", gap: 16 }} className="grid-two-responsive">
+        {/* Left Side: Category Filters & Touch Product Tiles */}
+        <div style={styles.card}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12, flexWrap: "wrap", gap: 8 }}>
+            <strong style={{ fontSize: 16, color: "#ffffff", fontFamily: "'Outfit', sans-serif" }}>
+              ⚡ {lang === "so" ? "Badeecadaha Taabashada (Touch Screen)" : "Touch Screen Catalog"}
+            </strong>
+
+            {/* Live Search */}
+            <input
+              style={{
+                ...styles.input,
+                margin: 0,
+                padding: "6px 12px",
+                fontSize: 12,
+                maxWidth: 180,
+                background: "rgba(0,0,0,0.3)",
+              }}
+              placeholder={lang === "so" ? "Raadi alaab..." : "Search products..."}
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+            />
+          </div>
+
+          {/* Category Filter Pills */}
+          <div style={{ display: "flex", gap: 6, overflowX: "auto", paddingBottom: 6, marginBottom: 12 }}>
+            {[
+              { id: "all", label: lang === "so" ? "Dhammaan" : "All" },
+              { id: "grains", label: lang === "so" ? "Bariis & Sonkor" : "Grains & Sugar" },
+              { id: "oils", label: lang === "so" ? "Saliid & Cunto" : "Oils & Food" },
+              { id: "beverages", label: lang === "so" ? "Caano & Biyo" : "Drinks & Dairy" },
+            ].map((cat) => (
+              <button
+                key={cat.id}
+                type="button"
+                className="touch-btn"
+                onClick={() => setCategoryFilter(cat.id)}
+                style={{
+                  background: categoryFilter === cat.id ? "rgba(20, 184, 166, 0.3)" : "rgba(255,255,255,0.05)",
+                  color: categoryFilter === cat.id ? "#2dd4bf" : "#94a3b8",
+                  border: categoryFilter === cat.id ? "1px solid rgba(45, 212, 191, 0.6)" : "1px solid rgba(255,255,255,0.1)",
+                  borderRadius: 20,
+                  padding: "4px 12px",
+                  fontSize: 11,
+                  fontWeight: 700,
+                  cursor: "pointer",
+                  whiteSpace: "nowrap",
+                }}
+              >
+                {cat.label}
+              </button>
+            ))}
+          </div>
+
+          {/* Product Tiles Grid */}
+          <div style={styles.productGrid} className="pos-grid-responsive">
+            {filteredProducts.map((p) => {
+              const inStock = p.sellable > 0;
+              return (
+                <button
+                  key={p.id}
+                  type="button"
+                  className="touch-btn glass-hover"
+                  style={{
+                    ...styles.productTile,
+                    opacity: inStock ? 1 : 0.45,
+                    border: inStock ? "1px solid rgba(255,255,255,0.12)" : "1px dashed rgba(239, 68, 68, 0.3)",
+                    textAlign: "left",
+                    minHeight: 110,
+                    display: "flex",
+                    flexDirection: "column",
+                    justifyContent: "space-between",
+                  }}
+                  onClick={() => quickAddProduct(p)}
+                >
+                  <div>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 4 }}>
+                      <strong style={{ fontSize: 13, color: "#ffffff", display: "block", lineHeight: 1.3 }}>{p.name}</strong>
+                    </div>
+                    <div style={{ display: "flex", gap: 6, alignItems: "center", marginTop: 4 }}>
+                      <span style={{ fontSize: 11, color: inStock ? "#94a3b8" : "#f87171" }}>
+                        {p.sellable} {p.unit} {lang === "so" ? "haray" : "left"}
+                      </span>
+                      {p.sku && (
+                        <span style={{ fontSize: 9, background: "rgba(255,255,255,0.1)", padding: "1px 5px", borderRadius: 4, color: "#cbd5e1" }}>
+                          {p.sku}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                  <div style={{ marginTop: 8, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                    <span style={{ fontWeight: 800, color: "#2dd4bf", fontSize: 14 }}>
+                      KES {money(p.sell_price)}
+                    </span>
+                    <span style={{ background: "rgba(20, 184, 166, 0.2)", color: "#2dd4bf", borderRadius: "50%", width: 22, height: 22, display: "inline-flex", alignItems: "center", justifyContent: "center", fontSize: 13, fontWeight: 900 }}>
+                      +
+                    </span>
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+
+          {/* Manual Bulk Add Form (Collapsible/Inline) */}
+          <div style={{ marginTop: 16, paddingTop: 14, borderTop: "1px solid rgba(255,255,255,0.1)" }}>
+            <div style={{ display: "flex", gap: 8, alignItems: "flex-end", flexWrap: "wrap" }}>
+              <div style={{ flex: 2, minWidth: 160 }}>
+                <label style={styles.label}>{lang === "so" ? "Xulo Alaab & Tiro" : "Manual Bulk Select"}</label>
+                <select
+                  style={{ ...styles.input, margin: 0 }}
+                  value={selectedPid}
+                  onChange={(e) => setSelectedPid(e.target.value)}
+                >
+                  {products.map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.name} · {p.sellable} {p.unit} · KES {money(p.sell_price)}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div style={{ flex: 1, minWidth: 90 }}>
+                <label style={styles.label}>{lang === "so" ? "Tirada" : "Quantity"}</label>
+                <input
+                  style={{ ...styles.input, margin: 0 }}
+                  type="number"
+                  step="any"
+                  min="0.001"
+                  value={qty}
+                  onChange={(e) => setQty(e.target.value)}
+                />
+              </div>
+
+              <button
+                type="button"
+                style={{ ...styles.btnGhost, height: 44, padding: "0 16px" }}
+                className="touch-btn"
+                onClick={addToCartManual}
+              >
+                + {lang === "so" ? "Ku dar" : "Add"}
+              </button>
+            </div>
           </div>
         </div>
 
-        {/* Customer & Payment Method */}
-        <div style={styles.card}>
-          <strong style={{ fontSize: 15, color: "#ffffff", fontFamily: "'Outfit', sans-serif" }}>Customer & Payment</strong>
-          <div style={{ marginTop: 12 }}>
-            <label style={styles.label}>Customer (Optional)</label>
-            <select
-              style={styles.input}
-              value={customerId}
-              onChange={(e) => setCustomerId(e.target.value)}
-            >
-              <option value="">Walk-in Customer</option>
-              {customers.map((c) => (
-                <option key={c.id} value={c.id}>
-                  {c.name} {c.kind ? `(${c.kind})` : ""}
-                </option>
-              ))}
-            </select>
+        {/* Right Side: Active Cart, Touch Numpad & Fast Checkout */}
+        <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+          {/* Cart Table Card */}
+          <div style={styles.card}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+              <strong style={{ fontSize: 16, color: "#ffffff", fontFamily: "'Outfit', sans-serif" }}>
+                🛒 {lang === "so" ? `Alaabta Dalab #${activeCartIdx + 1}` : `Order #${activeCartIdx + 1} Cart`}
+              </strong>
+              {cart.length > 0 && (
+                <button
+                  type="button"
+                  className="touch-btn"
+                  onClick={clearCurrentCart}
+                  style={{
+                    background: "rgba(239, 68, 68, 0.15)",
+                    color: "#f87171",
+                    border: "1px solid rgba(239, 68, 68, 0.3)",
+                    borderRadius: 8,
+                    padding: "4px 8px",
+                    fontSize: 11,
+                    fontWeight: 700,
+                    cursor: "pointer",
+                  }}
+                >
+                  {lang === "so" ? "Banneey Qasnadda" : "Clear Cart"}
+                </button>
+              )}
+            </div>
 
-            <label style={styles.label}>Payment Method</label>
-            <select
-              style={styles.input}
-              value={method}
-              onChange={(e) => setMethod(e.target.value)}
-            >
-              <option value="cash">Cash</option>
-              <option value="mpesa">M-Pesa</option>
-              <option value="card">Card</option>
-            </select>
+            {cart.length === 0 ? (
+              <div style={{ textAlign: "center", padding: "30px 10px", color: "#94a3b8" }}>
+                <div style={{ fontSize: 32, marginBottom: 8 }}>🛒</div>
+                <div>{lang === "so" ? "Qasnadda hadda waxba kuma jiraan." : "Cart is empty."}</div>
+                <div style={{ fontSize: 12, marginTop: 4, color: "#64748b" }}>
+                  {lang === "so" ? "Badeecad taabo ama baarkoodh sawir si aad ugu darto." : "Tap a product on the left or scan a barcode."}
+                </div>
+              </div>
+            ) : (
+              <div>
+                <div className="table-responsive-wrapper" style={{ maxHeight: 220, overflowY: "auto" }}>
+                  <table style={styles.table}>
+                    <thead>
+                      <tr style={{ borderBottom: "1px solid rgba(255,255,255,0.12)", color: "#94a3b8", fontSize: 12 }}>
+                        <th style={{ textAlign: "left", paddingBottom: 6 }}>{lang === "so" ? "Badeecada" : "Item"}</th>
+                        <th style={{ textAlign: "center", paddingBottom: 6 }}>{lang === "so" ? "Tiro" : "Qty"}</th>
+                        <th style={{ textAlign: "right", paddingBottom: 6 }}>{lang === "so" ? "Wadar" : "Total"}</th>
+                        <th></th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {cart.map((line) => (
+                        <tr key={line.product_id} style={{ borderBottom: "1px solid rgba(255,255,255,0.06)" }}>
+                          <td style={{ padding: "8px 0" }}>
+                            <strong style={{ color: "#ffffff", fontSize: 13, display: "block" }}>{line.name}</strong>
+                            <span style={{ fontSize: 11, color: "#94a3b8" }}>@ KES {money(line.price)}</span>
+                          </td>
+                          <td style={{ textAlign: "center", whiteSpace: "nowrap", padding: "8px 0" }}>
+                            <div style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+                              <button
+                                type="button"
+                                className="touch-btn"
+                                style={styles.touchStepBtn}
+                                onClick={() => updateCartQty(line.product_id, -1)}
+                              >
+                                -
+                              </button>
+                              <span style={{ minWidth: 26, textAlign: "center", fontWeight: 800, color: "#ffffff", fontSize: 13 }}>
+                                {line.qty}
+                              </span>
+                              <button
+                                type="button"
+                                className="touch-btn"
+                                style={styles.touchStepBtn}
+                                onClick={() => updateCartQty(line.product_id, 1)}
+                              >
+                                +
+                              </button>
+                            </div>
+                          </td>
+                          <td style={{ textAlign: "right", fontWeight: 700, padding: "8px 4px", color: "#2dd4bf", fontSize: 13 }}>
+                            KES {money(line.qty * line.price)}
+                          </td>
+                          <td style={{ textAlign: "right", padding: "8px 0" }}>
+                            <button
+                              style={{ ...styles.btnDangerSmall, padding: "3px 7px" }}
+                              className="touch-btn"
+                              onClick={() => removeFromCart(line.product_id)}
+                            >
+                              ✕
+                            </button>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+
+                {/* Total Display */}
+                <div
+                  style={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    alignItems: "center",
+                    padding: "12px 14px",
+                    marginTop: 10,
+                    background: "rgba(0,0,0,0.3)",
+                    borderRadius: 12,
+                    border: "1px solid rgba(255,255,255,0.08)",
+                  }}
+                >
+                  <span style={{ fontSize: 14, color: "#94a3b8", fontWeight: 700 }}>
+                    {lang === "so" ? "Wadarta Guud:" : "Grand Total:"}
+                  </span>
+                  <span style={{ fontSize: 22, fontWeight: 900, color: "#2dd4bf", fontFamily: "'Outfit', sans-serif" }}>
+                    KES {money(totalAmount)}
+                  </span>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Customer & Payment Method Selector */}
+          <div style={styles.card}>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+              <div>
+                <label style={styles.label}>{lang === "so" ? "Macmiilka" : "Customer"}</label>
+                <select
+                  style={{ ...styles.input, margin: 0 }}
+                  value={customerId}
+                  onChange={(e) => setCustomerId(e.target.value)}
+                >
+                  <option value="">{lang === "so" ? "Macmiil Caadi ah" : "Walk-in Customer"}</option>
+                  {customers.map((c) => (
+                    <option key={c.id} value={c.id}>
+                      {c.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div>
+                <label style={styles.label}>{lang === "so" ? "Habka Bixinta" : "Payment Method"}</label>
+                <select
+                  style={{ ...styles.input, margin: 0 }}
+                  value={method}
+                  onChange={(e) => setMethod(e.target.value)}
+                >
+                  <option value="cash">💵 {lang === "so" ? "Kaash (Cash)" : "Cash"}</option>
+                  <option value="mpesa">📱 M-Pesa / EVC / Sahal</option>
+                  <option value="card">💳 {lang === "so" ? "Kaadhka Bangiga" : "Bank Card"}</option>
+                  <option value="credit">📑 {lang === "so" ? "Deyr / Akoon" : "Store Credit"}</option>
+                </select>
+              </div>
+            </div>
 
             {method !== "cash" && (
-              <>
+              <div style={{ marginTop: 10 }}>
                 <label style={styles.label}>
-                  {method === "mpesa" ? "M-Pesa Reference Code" : "Card Slip Number"}
+                  {method === "mpesa" ? (lang === "so" ? "Koodhka Fariinta M-Pesa/EVC" : "M-Pesa Reference") : (lang === "so" ? "Lambarka Rasiidka Kaadhka" : "Card Slip Ref")}
                 </label>
                 <input
-                  style={styles.input}
+                  style={{ ...styles.input, margin: 0 }}
                   placeholder="e.g. QKH7189XYZ"
                   value={reference}
                   onChange={(e) => setReference(e.target.value)}
                 />
-              </>
+              </div>
             )}
           </div>
+
+          {/* Touch Screen Numpad & Change Calculator (When Cash Selected) */}
+          {method === "cash" && cart.length > 0 && (
+            <div style={styles.card}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                <strong style={{ fontSize: 14, color: "#ffffff", fontFamily: "'Outfit', sans-serif" }}>
+                  🔢 {lang === "so" ? "Kiboodhka Taabashada & Celinta (Numpad)" : "Touch Numpad & Change Due"}
+                </strong>
+                <button
+                  type="button"
+                  className="touch-btn"
+                  onClick={() => setShowNumpad(!showNumpad)}
+                  style={{ background: "transparent", border: "none", color: "#2dd4bf", fontSize: 11, cursor: "pointer", fontWeight: 700 }}
+                >
+                  {showNumpad ? (lang === "so" ? "Qari ▲" : "Hide ▲") : (lang === "so" ? "Muuji ▼" : "Show ▼")}
+                </button>
+              </div>
+
+              {/* Tendered and Change Summary Bar */}
+              <div
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "1fr 1fr",
+                  gap: 8,
+                  marginBottom: 10,
+                  background: "rgba(0,0,0,0.35)",
+                  padding: "8px 12px",
+                  borderRadius: 10,
+                  border: "1px solid rgba(255,255,255,0.08)",
+                }}
+              >
+                <div>
+                  <div style={{ fontSize: 11, color: "#94a3b8" }}>{lang === "so" ? "La Dhiibtay (Tendered):" : "Tendered:"}</div>
+                  <div style={{ fontSize: 18, fontWeight: 800, color: "#f8fafc" }}>
+                    KES {tendered ? money(tendered) : "0.00"}
+                  </div>
+                </div>
+                <div style={{ textAlign: "right" }}>
+                  <div style={{ fontSize: 11, color: "#94a3b8" }}>{lang === "so" ? "La Celiyo (Change Due):" : "Change Due:"}</div>
+                  <div style={{ fontSize: 18, fontWeight: 900, color: changeDue > 0 ? "#34d399" : "#94a3b8" }}>
+                    KES {money(changeDue)}
+                  </div>
+                </div>
+              </div>
+
+              {/* Quick Cash Preset Buttons */}
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 10 }}>
+                <button
+                  type="button"
+                  className="touch-btn"
+                  onClick={() => addQuickPreset("EXACT")}
+                  style={{
+                    background: "rgba(20, 184, 166, 0.3)",
+                    color: "#2dd4bf",
+                    border: "1px solid rgba(45, 212, 191, 0.5)",
+                    borderRadius: 8,
+                    padding: "6px 10px",
+                    fontSize: 11,
+                    fontWeight: 800,
+                    cursor: "pointer",
+                  }}
+                >
+                  ✓ {lang === "so" ? "Dhab ah (Exact)" : "Exact"}
+                </button>
+                {[100, 200, 500, 1000, 2000].map((amt) => (
+                  <button
+                    key={amt}
+                    type="button"
+                    className="touch-btn"
+                    onClick={() => addQuickPreset(amt)}
+                    style={{
+                      background: "rgba(255,255,255,0.06)",
+                      color: "#e2e8f0",
+                      border: "1px solid rgba(255,255,255,0.12)",
+                      borderRadius: 8,
+                      padding: "6px 10px",
+                      fontSize: 11,
+                      fontWeight: 700,
+                      cursor: "pointer",
+                    }}
+                  >
+                    +{amt}
+                  </button>
+                ))}
+              </div>
+
+              {/* Touch Numpad Grid */}
+              {showNumpad && (
+                <div
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns: "repeat(4, 1fr)",
+                    gap: 6,
+                  }}
+                >
+                  {["1", "2", "3", "C", "4", "5", "6", "BACK", "7", "8", "9", "00", ".", "0", "000"].map((btn) => {
+                    const isSpecial = btn === "C" || btn === "BACK";
+                    return (
+                      <button
+                        key={btn}
+                        type="button"
+                        className="touch-btn glass-hover"
+                        onClick={() => handleNumpadPress(btn)}
+                        style={{
+                          background: isSpecial ? "rgba(239, 68, 68, 0.2)" : "rgba(255,255,255,0.08)",
+                          color: isSpecial ? "#f87171" : "#ffffff",
+                          border: "1px solid rgba(255,255,255,0.12)",
+                          borderRadius: 8,
+                          padding: "10px 0",
+                          fontSize: 15,
+                          fontWeight: 800,
+                          cursor: "pointer",
+                          minHeight: 44,
+                        }}
+                      >
+                        {btn === "BACK" ? "⌫" : btn}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Checkout Button */}
+          <button
+            type="button"
+            className="touch-btn"
+            style={{
+              ...styles.btnPrimary,
+              width: "100%",
+              padding: "14px 20px",
+              fontSize: 16,
+              minHeight: 52,
+              boxShadow: "0 0 25px rgba(20, 184, 166, 0.4)",
+              opacity: cart.length === 0 ? 0.5 : 1,
+            }}
+            disabled={cart.length === 0}
+            onClick={handleCheckout}
+          >
+            {lang === "so"
+              ? `Dhammaystir Iibka · KES ${money(totalAmount)} ⚡`
+              : `Complete Sale · KES ${money(totalAmount)} ⚡`}
+          </button>
         </div>
       </div>
 
-      {/* Cart Summary */}
-      <div style={{ ...styles.card, marginTop: 16 }}>
-        <strong style={{ fontSize: 15, color: "#ffffff", fontFamily: "'Outfit', sans-serif" }}>Current Sale Cart</strong>
-        {cart.length === 0 ? (
-          <p style={{ color: "#94a3b8", margin: "10px 0" }}>Cart is currently empty. Tap a product above to add.</p>
-        ) : (
-          <div style={{ marginTop: 14 }}>
-            <div className="table-responsive-wrapper">
-              <table style={styles.table}>
+      {/* ── ALL PRINT MODAL (Screen Preview & Direct Print) ──────────────── */}
+      {printModalOpen && lastReceipt && (
+        <div
+          style={{
+            position: "fixed",
+            top: 0,
+            left: 0,
+            right: 0,
+            bottom: 0,
+            zIndex: 10000,
+            background: "rgba(0, 0, 0, 0.8)",
+            backdropFilter: "blur(12px)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            padding: 16,
+          }}
+        >
+          <div
+            style={{
+              background: "#0c1322",
+              border: "1px solid rgba(255, 255, 255, 0.18)",
+              borderRadius: 18,
+              width: "100%",
+              maxWidth: 580,
+              maxHeight: "92vh",
+              display: "flex",
+              flexDirection: "column",
+              overflow: "hidden",
+              boxShadow: "0 25px 60px rgba(0,0,0,0.8)",
+            }}
+          >
+            {/* Header with Print Format Tabs */}
+            <div style={{ padding: "16px 20px", borderBottom: "1px solid rgba(255,255,255,0.1)", background: "rgba(0,0,0,0.3)" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+                <strong style={{ fontSize: 17, color: "#ffffff", fontFamily: "'Outfit', sans-serif" }}>
+                  🖨️ {lang === "so" ? `Daabacaadda Iibka #${lastReceipt.id}` : `Print Sale #${lastReceipt.id}`}
+                </strong>
+                <button
+                  type="button"
+                  className="touch-btn"
+                  onClick={() => setPrintModalOpen(false)}
+                  style={{ background: "transparent", border: "none", color: "#94a3b8", fontSize: 20, cursor: "pointer" }}
+                >
+                  ✕
+                </button>
+              </div>
+
+              {/* Format Switcher Pills */}
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                {[
+                  { id: "thermal80", label: "🧾 80mm Thermal POS" },
+                  { id: "thermal58", label: "📱 58mm Mobile Slip" },
+                  { id: "dispatch", label: "📦 Dispatch Pick Slip" },
+                  { id: "labels", label: "🏷️ Barcode Labels" },
+                  { id: "invoiceA4", label: "📄 A4 Tax Invoice" },
+                ].map((fmt) => (
+                  <button
+                    key={fmt.id}
+                    type="button"
+                    className="touch-btn"
+                    onClick={() => setPrintFormat(fmt.id)}
+                    style={{
+                      background: printFormat === fmt.id ? "linear-gradient(135deg, #0d9488 0%, #14b8a6 100%)" : "rgba(255,255,255,0.06)",
+                      color: printFormat === fmt.id ? "#ffffff" : "#94a3b8",
+                      border: "none",
+                      borderRadius: 8,
+                      padding: "6px 11px",
+                      fontSize: 11,
+                      fontWeight: 700,
+                      cursor: "pointer",
+                    }}
+                  >
+                    {fmt.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Scrollable Receipt Preview (High Contrast Thermal / A4 Paper look) */}
+            <div style={{ flex: 1, overflowY: "auto", padding: 20, background: "#1e293b", display: "flex", justifyContent: "center" }}>
+              {/* 80mm Thermal Receipt */}
+              {printFormat === "thermal80" && (
+                <div
+                  style={{
+                    background: "#ffffff",
+                    color: "#000000",
+                    width: 320,
+                    padding: "16px 14px",
+                    fontFamily: "'Courier New', Courier, monospace",
+                    fontSize: 12,
+                    lineHeight: 1.35,
+                    boxShadow: "0 10px 30px rgba(0,0,0,0.5)",
+                  }}
+                >
+                  <div style={{ textAlign: "center", marginBottom: 10 }}>
+                    <div style={{ fontWeight: 900, fontSize: 16, letterSpacing: -0.5 }}>iCash Wholesale & POS</div>
+                    <div>Bakaara Market / Nairobi Gate 4</div>
+                    <div>Tel: +252 61 5000111 / +254 700 000000</div>
+                    <div>PIN / VAT: P051289304Z</div>
+                    <div style={{ margin: "6px 0", borderBottom: "1px dashed #000" }}></div>
+                    <div style={{ fontWeight: 800 }}>TAX INVOICE / RECEIPT #{lastReceipt.id}</div>
+                    <div style={{ fontSize: 11 }}>{lastReceipt.date}</div>
+                    <div style={{ fontSize: 11 }}>Station: {lastReceipt.station}</div>
+                    <div style={{ fontSize: 11 }}>Cashier: {lastReceipt.cashier}</div>
+                    <div style={{ fontSize: 11 }}>Customer: {lastReceipt.customer}</div>
+                    <div style={{ margin: "6px 0", borderBottom: "1px dashed #000" }}></div>
+                  </div>
+
+                  {/* Items Table */}
+                  <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11 }}>
+                    <thead>
+                      <tr style={{ borderBottom: "1px solid #000", textAlign: "left" }}>
+                        <th>ITEM</th>
+                        <th style={{ textAlign: "center" }}>QTY</th>
+                        <th style={{ textAlign: "right" }}>PRICE</th>
+                        <th style={{ textAlign: "right" }}>AMT</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {lastReceipt.cart.map((item, idx) => (
+                        <tr key={idx}>
+                          <td style={{ padding: "4px 0" }}>{item.name}</td>
+                          <td style={{ textAlign: "center" }}>{item.qty}</td>
+                          <td style={{ textAlign: "right" }}>{money(item.price)}</td>
+                          <td style={{ textAlign: "right" }}>{money(item.qty * item.price)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+
+                  <div style={{ margin: "8px 0", borderBottom: "1px dashed #000" }}></div>
+
+                  {/* Totals Breakdown */}
+                  <div style={{ fontSize: 12 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between" }}>
+                      <span>SUBTOTAL:</span>
+                      <span>KES {money(lastReceipt.total * 0.95)}</span>
+                    </div>
+                    <div style={{ display: "flex", justifyContent: "space-between" }}>
+                      <span>VAT (5%):</span>
+                      <span>KES {money(lastReceipt.total * 0.05)}</span>
+                    </div>
+                    <div style={{ display: "flex", justifyContent: "space-between", fontWeight: 900, fontSize: 14, margin: "4px 0" }}>
+                      <span>TOTAL:</span>
+                      <span>KES {money(lastReceipt.total)}</span>
+                    </div>
+                    <div style={{ display: "flex", justifyContent: "space-between" }}>
+                      <span>PAID ({lastReceipt.method.toUpperCase()}):</span>
+                      <span>KES {money(lastReceipt.tendered)}</span>
+                    </div>
+                    <div style={{ display: "flex", justifyContent: "space-between", fontWeight: 800 }}>
+                      <span>CHANGE DUE:</span>
+                      <span>KES {money(lastReceipt.change)}</span>
+                    </div>
+                    {lastReceipt.reference && (
+                      <div style={{ fontSize: 10, marginTop: 4 }}>Ref: {lastReceipt.reference}</div>
+                    )}
+                  </div>
+
+                  <div style={{ margin: "8px 0", borderBottom: "1px dashed #000" }}></div>
+
+                  {/* Monospace Barcode & QR representation */}
+                  <div style={{ textAlign: "center", fontSize: 10, marginTop: 6 }}>
+                    <div style={{ letterSpacing: 3, fontWeight: 900, fontSize: 14 }}>||||| | |||| || |||||| | ||||</div>
+                    <div style={{ marginTop: 2 }}>*ICASH-{lastReceipt.id}-{Date.now().toString().slice(-4)}*</div>
+                    <div style={{ marginTop: 8, fontStyle: "italic" }}>
+                      {lang === "so"
+                        ? "Waad ku mahadsan tahay ganacsigaaga!"
+                        : "Thank you for shopping with us!"}
+                    </div>
+                    <div>Goods once sold are not returnable after 48h.</div>
+                  </div>
+                </div>
+              )}
+
+              {/* 58mm Mobile Thermal Receipt */}
+              {printFormat === "thermal58" && (
+                <div
+                  style={{
+                    background: "#ffffff",
+                    color: "#000000",
+                    width: 230,
+                    padding: "12px 10px",
+                    fontFamily: "'Courier New', Courier, monospace",
+                    fontSize: 10,
+                    lineHeight: 1.25,
+                    boxShadow: "0 10px 30px rgba(0,0,0,0.5)",
+                  }}
+                >
+                  <div style={{ textAlign: "center", fontWeight: 800, fontSize: 13 }}>iCash POS (58mm)</div>
+                  <div style={{ textAlign: "center", fontSize: 9 }}>Mogadishu / Nairobi Hub</div>
+                  <div style={{ borderBottom: "1px dashed #000", margin: "4px 0" }}></div>
+                  <div>RCPT: #{lastReceipt.id} | {lastReceipt.station}</div>
+                  <div>DATE: {lastReceipt.date}</div>
+                  <div style={{ borderBottom: "1px dashed #000", margin: "4px 0" }}></div>
+                  {lastReceipt.cart.map((item, idx) => (
+                    <div key={idx} style={{ display: "flex", justifyContent: "space-between", margin: "2px 0" }}>
+                      <span>{item.name.slice(0, 16)} x{item.qty}</span>
+                      <span>{money(item.qty * item.price)}</span>
+                    </div>
+                  ))}
+                  <div style={{ borderBottom: "1px dashed #000", margin: "4px 0" }}></div>
+                  <div style={{ display: "flex", justifyContent: "space-between", fontWeight: 800 }}>
+                    <span>TOTAL:</span>
+                    <span>KES {money(lastReceipt.total)}</span>
+                  </div>
+                  <div style={{ display: "flex", justifyContent: "space-between" }}>
+                    <span>PAID:</span>
+                    <span>KES {money(lastReceipt.tendered)}</span>
+                  </div>
+                  <div style={{ display: "flex", justifyContent: "space-between" }}>
+                    <span>CHANGE:</span>
+                    <span>KES {money(lastReceipt.change)}</span>
+                  </div>
+                  <div style={{ textAlign: "center", marginTop: 8, fontSize: 9 }}>
+                    * THANK YOU *
+                  </div>
+                </div>
+              )}
+
+              {/* Warehouse Dispatch Slip */}
+              {printFormat === "dispatch" && (
+                <div
+                  style={{
+                    background: "#ffffff",
+                    color: "#000000",
+                    width: 360,
+                    padding: "18px 16px",
+                    fontFamily: "'Plus Jakarta Sans', sans-serif",
+                    fontSize: 12,
+                    boxShadow: "0 10px 30px rgba(0,0,0,0.5)",
+                  }}
+                >
+                  <div style={{ display: "flex", justifyContent: "space-between", borderBottom: "2px solid #000", paddingBottom: 8, marginBottom: 10 }}>
+                    <div>
+                      <div style={{ fontWeight: 900, fontSize: 16 }}>WAREHOUSE PICK & DISPATCH</div>
+                      <div style={{ fontSize: 11, color: "#475569" }}>Order Ref #{lastReceipt.id} · {lastReceipt.station}</div>
+                    </div>
+                    <div style={{ textAlign: "right", fontSize: 11 }}>
+                      <div>{lastReceipt.date}</div>
+                      <strong>PRIORITY: NORMAL</strong>
+                    </div>
+                  </div>
+
+                  <div style={{ marginBottom: 10, fontSize: 11, background: "#f1f5f9", padding: 8, borderRadius: 4 }}>
+                    <div><strong>Customer:</strong> {lastReceipt.customer}</div>
+                    <div><strong>Dispatch To:</strong> Loading Bay / Counter Delivery</div>
+                  </div>
+
+                  <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11, marginBottom: 12 }}>
+                    <thead>
+                      <tr style={{ background: "#e2e8f0", textAlign: "left" }}>
+                        <th style={{ padding: "4px 6px" }}>[✓]</th>
+                        <th style={{ padding: "4px 6px" }}>ITEM</th>
+                        <th style={{ padding: "4px 6px" }}>SKU</th>
+                        <th style={{ padding: "4px 6px", textAlign: "right" }}>QTY</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {lastReceipt.cart.map((item, idx) => (
+                        <tr key={idx} style={{ borderBottom: "1px solid #cbd5e1" }}>
+                          <td style={{ padding: "6px" }}>[ ]</td>
+                          <td style={{ padding: "6px", fontWeight: 700 }}>{item.name}</td>
+                          <td style={{ padding: "6px", fontSize: 10 }}>{item.sku || `SKU-${item.product_id}`}</td>
+                          <td style={{ padding: "6px", textAlign: "right", fontWeight: 800 }}>{item.qty} {item.unit || "unit"}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+
+                  <div style={{ borderTop: "1px dashed #000", paddingTop: 10, marginTop: 12, fontSize: 11, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                    <div>
+                      <div>Picked By: _______________</div>
+                      <div style={{ marginTop: 6 }}>Sign: ___________________</div>
+                    </div>
+                    <div>
+                      <div>Verified By: ____________</div>
+                      <div style={{ marginTop: 6 }}>Driver/Customer: ________</div>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* Barcode Shelf Price Labels Sheet */}
+              {printFormat === "labels" && (
+                <div
+                  style={{
+                    background: "#ffffff",
+                    color: "#000000",
+                    width: 380,
+                    padding: 14,
+                    display: "grid",
+                    gridTemplateColumns: "1fr 1fr",
+                    gap: 10,
+                    boxShadow: "0 10px 30px rgba(0,0,0,0.5)",
+                  }}
+                >
+                  {lastReceipt.cart.map((item, idx) => (
+                    <div
+                      key={idx}
+                      style={{
+                        border: "1.5px solid #000",
+                        padding: 8,
+                        borderRadius: 6,
+                        textAlign: "center",
+                        fontFamily: "'Plus Jakarta Sans', sans-serif",
+                      }}
+                    >
+                      <div style={{ fontSize: 11, fontWeight: 800, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                        {item.name}
+                      </div>
+                      <div style={{ fontSize: 9, color: "#475569", margin: "2px 0" }}>
+                        SKU: {item.sku || `PRD-${item.product_id}`}
+                      </div>
+                      <div style={{ fontSize: 16, fontWeight: 900, color: "#0f766e", margin: "4px 0" }}>
+                        KES {money(item.price)}
+                      </div>
+                      <div style={{ fontSize: 9, fontFamily: "monospace", letterSpacing: 2 }}>
+                        ||| || |||| | |||||
+                      </div>
+                      <div style={{ fontSize: 8, color: "#64748b" }}>FEFO Expiry: 2027-06-30</div>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* A4 Tax Invoice */}
+              {printFormat === "invoiceA4" && (
+                <div
+                  style={{
+                    background: "#ffffff",
+                    color: "#000000",
+                    width: 440,
+                    padding: 24,
+                    fontFamily: "'Plus Jakarta Sans', sans-serif",
+                    fontSize: 11,
+                    boxShadow: "0 10px 30px rgba(0,0,0,0.5)",
+                  }}
+                >
+                  <div style={{ display: "flex", justifyContent: "space-between", borderBottom: "2px solid #0d9488", paddingBottom: 10, marginBottom: 12 }}>
+                    <div>
+                      <div style={{ fontWeight: 900, fontSize: 18, color: "#0d9488" }}>iCash Wholesale Ltd</div>
+                      <div>Industrial Area / Bakaara Hub</div>
+                      <div>Tel: +252 61 5000111 / +254 700 000000</div>
+                    </div>
+                    <div style={{ textAlign: "right" }}>
+                      <div style={{ fontWeight: 800, fontSize: 14 }}>COMMERCIAL INVOICE</div>
+                      <div>Inv #: INV-{lastReceipt.id.toString().padStart(6, "0")}</div>
+                      <div>Date: {lastReceipt.date}</div>
+                    </div>
+                  </div>
+
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 12, background: "#f8fafc", padding: 10, borderRadius: 6 }}>
+                    <div>
+                      <strong>Bill To:</strong>
+                      <div>{lastReceipt.customer}</div>
+                      <div>{lastReceipt.customerPhone || "Walk-in Retailer"}</div>
+                    </div>
+                    <div>
+                      <strong>Payment Terms:</strong>
+                      <div>Method: {lastReceipt.method.toUpperCase()}</div>
+                      <div>Station: {lastReceipt.station}</div>
+                    </div>
+                  </div>
+
+                  <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 10, marginBottom: 12 }}>
+                    <thead>
+                      <tr style={{ background: "#0d9488", color: "#fff", textAlign: "left" }}>
+                        <th style={{ padding: "5px" }}>Item Description</th>
+                        <th style={{ padding: "5px", textAlign: "center" }}>Qty</th>
+                        <th style={{ padding: "5px", textAlign: "right" }}>Unit Price</th>
+                        <th style={{ padding: "5px", textAlign: "right" }}>Amount</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {lastReceipt.cart.map((item, idx) => (
+                        <tr key={idx} style={{ borderBottom: "1px solid #e2e8f0" }}>
+                          <td style={{ padding: "6px 5px", fontWeight: 600 }}>{item.name}</td>
+                          <td style={{ padding: "6px 5px", textAlign: "center" }}>{item.qty} {item.unit}</td>
+                          <td style={{ padding: "6px 5px", textAlign: "right" }}>KES {money(item.price)}</td>
+                          <td style={{ padding: "6px 5px", textAlign: "right", fontWeight: 700 }}>KES {money(item.qty * item.price)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+
+                  <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 14 }}>
+                    <div style={{ width: 180, fontSize: 11 }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", margin: "2px 0" }}>
+                        <span>Subtotal:</span>
+                        <span>KES {money(lastReceipt.total * 0.95)}</span>
+                      </div>
+                      <div style={{ display: "flex", justifyContent: "space-between", margin: "2px 0" }}>
+                        <span>VAT (5%):</span>
+                        <span>KES {money(lastReceipt.total * 0.05)}</span>
+                      </div>
+                      <div style={{ display: "flex", justifyContent: "space-between", fontWeight: 800, fontSize: 13, borderTop: "1px solid #000", paddingTop: 4 }}>
+                        <span>Total Paid:</span>
+                        <span>KES {money(lastReceipt.total)}</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div style={{ display: "flex", justifyContent: "space-between", borderTop: "1px solid #cbd5e1", paddingTop: 10, fontSize: 10, color: "#64748b" }}>
+                    <div>Authorized Signature: __________________</div>
+                    <div>Official Stamp: [               ]</div>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Print Action Bar */}
+            <div
+              style={{
+                padding: "14px 20px",
+                borderTop: "1px solid rgba(255,255,255,0.1)",
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+                background: "rgba(0,0,0,0.3)",
+                flexWrap: "wrap",
+                gap: 10,
+              }}
+            >
+              <div style={{ fontSize: 12, color: "#94a3b8" }}>
+                Format: <strong>{printFormat}</strong>
+              </div>
+
+              <div style={{ display: "flex", gap: 10 }}>
+                <button
+                  type="button"
+                  className="touch-btn"
+                  onClick={() => setPrintModalOpen(false)}
+                  style={{
+                    background: "rgba(255,255,255,0.1)",
+                    color: "#e2e8f0",
+                    border: "none",
+                    borderRadius: 10,
+                    padding: "8px 16px",
+                    fontWeight: 700,
+                    cursor: "pointer",
+                  }}
+                >
+                  {lang === "so" ? "Xir" : "Close"}
+                </button>
+
+                <button
+                  type="button"
+                  className="touch-btn"
+                  onClick={() => window.print()}
+                  style={{
+                    background: "linear-gradient(135deg, #0d9488 0%, #14b8a6 100%)",
+                    color: "#ffffff",
+                    border: "none",
+                    borderRadius: 10,
+                    padding: "8px 22px",
+                    fontSize: 14,
+                    fontWeight: 800,
+                    cursor: "pointer",
+                    boxShadow: "0 0 20px rgba(20, 184, 166, 0.4)",
+                    display: "inline-flex",
+                    alignItems: "center",
+                    gap: 6,
+                  }}
+                >
+                  <span>🖨️</span>
+                  <span>{lang === "so" ? "Daabac Hadda (Print Now)" : "Print Now"}</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── MULTI-DEVICE WI-FI LAN CONNECTION HUB MODAL ─────────────────── */}
+      {showDeviceHub && (
+        <div
+          style={{
+            position: "fixed",
+            top: 0,
+            left: 0,
+            right: 0,
+            bottom: 0,
+            zIndex: 10000,
+            background: "rgba(0, 0, 0, 0.8)",
+            backdropFilter: "blur(12px)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            padding: 16,
+          }}
+        >
+          <div
+            style={{
+              background: "#0c1322",
+              border: "1px solid rgba(255, 255, 255, 0.18)",
+              borderRadius: 18,
+              width: "100%",
+              maxWidth: 540,
+              padding: 24,
+              boxShadow: "0 25px 60px rgba(0,0,0,0.8)",
+            }}
+          >
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                <div style={{ fontSize: 24 }}>📲</div>
+                <div>
+                  <h3 style={{ margin: 0, fontSize: 18, color: "#ffffff", fontFamily: "'Outfit', sans-serif" }}>
+                    {lang === "so" ? "Xarunta Qalabka Kala Duwan (Multi-Device Hub)" : "Multi-Device Network Hub"}
+                  </h3>
+                  <div style={{ fontSize: 12, color: "#94a3b8" }}>
+                    {lang === "so" ? "Sida iPads, Telefoonno & Sunmi POS loogu xiro hal mar" : "Connect several tablets & POS terminals to one database"}
+                  </div>
+                </div>
+              </div>
+              <button
+                type="button"
+                className="touch-btn"
+                onClick={() => setShowDeviceHub(false)}
+                style={{ background: "transparent", border: "none", color: "#94a3b8", fontSize: 20, cursor: "pointer" }}
+              >
+                ✕
+              </button>
+            </div>
+
+            {/* Local Network URL Card */}
+            <div
+              style={{
+                background: "rgba(13, 148, 136, 0.15)",
+                border: "1px solid rgba(45, 212, 191, 0.4)",
+                borderRadius: 12,
+                padding: "14px 16px",
+                marginBottom: 16,
+              }}
+            >
+              <div style={{ fontSize: 12, color: "#2dd4bf", fontWeight: 800, textTransform: "uppercase", marginBottom: 4 }}>
+                🌐 {lang === "so" ? "Cinwaanka Wi-Fi-ga ee Qalabka Kale Ka Furan Karto:" : "Local Wi-Fi Address for Other Devices:"}
+              </div>
+              <div
+                style={{
+                  fontFamily: "monospace",
+                  fontSize: 18,
+                  fontWeight: 900,
+                  color: "#ffffff",
+                  background: "rgba(0,0,0,0.4)",
+                  padding: "8px 12px",
+                  borderRadius: 8,
+                  display: "flex",
+                  justifyContent: "space-between",
+                  alignItems: "center",
+                }}
+              >
+                <span>http://192.168.0.100:3005</span>
+                <button
+                  type="button"
+                  className="touch-btn"
+                  onClick={() => {
+                    if (typeof navigator !== "undefined" && navigator.clipboard) {
+                      navigator.clipboard.writeText("http://192.168.0.100:3005");
+                      flash(lang === "so" ? "Link-ga waa la koobiyeeyay!" : "Link copied to clipboard!");
+                    }
+                  }}
+                  style={{
+                    background: "rgba(20, 184, 166, 0.3)",
+                    border: "none",
+                    borderRadius: 6,
+                    padding: "4px 8px",
+                    color: "#2dd4bf",
+                    fontSize: 11,
+                    fontWeight: 700,
+                    cursor: "pointer",
+                  }}
+                >
+                  Copy
+                </button>
+              </div>
+            </div>
+
+            {/* Step-by-Step Instructions */}
+            <div style={{ fontSize: 13, lineHeight: 1.6, color: "#cbd5e1", marginBottom: 16 }}>
+              <div style={{ fontWeight: 800, color: "#ffffff", marginBottom: 8 }}>
+                {lang === "so" ? "Tallaabooyinka Xiriirinta (Fudud & Degdeg ah):" : "How to Connect Other Devices:"}
+              </div>
+              <ol style={{ margin: 0, paddingLeft: 20 }}>
+                <li>
+                  {lang === "so"
+                    ? "Hubi in iPad-ka, Tablet-ka ama Telefoonka uu ku xiran yahay isla Wi-Fi-ga kombuyuutarkani ku xiran yahay."
+                    : "Ensure your iPad, tablet, or phone is connected to the same Wi-Fi network as this computer."}
+                </li>
+                <li>
+                  {lang === "so"
+                    ? "Browser-ka Safari ama Chrome ka fur cinwaanka kore: http://192.168.0.100:3005."
+                    : "Open Safari or Chrome on the tablet and visit: http://192.168.0.100:3005."}
+                </li>
+                <li>
+                  {lang === "so"
+                    ? "Dooro Register-kaaga (tusaale: 'Till 2' ama 'Tablet 1')."
+                    : "Select your station register (e.g. 'Till 2' or 'Tablet 1')."}
+                </li>
+                <li>
+                  {lang === "so"
+                    ? "Dhammaan iibka ka dhaca qalab kasta isla ilbiriqsiga ayaa lagu wadaagayaa (Real-time Broadcast Sync)!"
+                    : "All sales completed on any device sync in real-time across all terminals without conflict!"}
+                </li>
+              </ol>
+            </div>
+
+            {/* Currently Online Tills Status */}
+            <div style={{ background: "rgba(0,0,0,0.3)", padding: 12, borderRadius: 10, border: "1px solid rgba(255,255,255,0.08)" }}>
+              <div style={{ fontSize: 12, color: "#94a3b8", fontWeight: 700, marginBottom: 8 }}>
+                🟢 {lang === "so" ? "Qalabka Hadda Diyaarka ah (Active Terminals):" : "Active Terminals Status:"}
+              </div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, fontSize: 12 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 6, color: "#34d399" }}>
+                  <span>●</span> <span>{station} (Hadda furan)</span>
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 6, color: "#38bdf8" }}>
+                  <span>●</span> <span>Till 2 (Express Counter)</span>
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 6, color: "#a78bfa" }}>
+                  <span>●</span> <span>Tablet 1 (Floor Runner)</span>
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 6, color: "#fbbf24" }}>
+                  <span>●</span> <span>Warehouse (Stock Dispatch)</span>
+                </div>
+              </div>
+            </div>
+
+            <div style={{ textAlign: "right", marginTop: 18 }}>
+              <button
+                type="button"
+                className="touch-btn"
+                onClick={() => setShowDeviceHub(false)}
+                style={{
+                  background: "linear-gradient(135deg, #0d9488 0%, #14b8a6 100%)",
+                  color: "#ffffff",
+                  border: "none",
+                  borderRadius: 10,
+                  padding: "8px 20px",
+                  fontSize: 13,
+                  fontWeight: 800,
+                  cursor: "pointer",
+                }}
+              >
+                {lang === "so" ? "Waan Fahmay ✓" : "Got It ✓"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── ISOLATED CLEAN PRINT VIEW FOR BROWSER / THERMAL PRINTERS ─────── */}
+      {lastReceipt && (
+        <div className="print-only">
+          {printFormat === "thermal58" ? (
+            <div className="receipt-58mm">
+              <div style={{ textAlign: "center", fontWeight: "bold", fontSize: 12 }}>iCash Wholesale</div>
+              <div style={{ textAlign: "center", fontSize: 9 }}>Mogadishu / Nairobi</div>
+              <div style={{ textAlign: "center", fontSize: 9 }}>Tel: +252 61 5000111</div>
+              <div style={{ borderBottom: "1px dashed #000", margin: "4px 0" }}></div>
+              <div>RCPT: #{lastReceipt.id} | {lastReceipt.station}</div>
+              <div>DATE: {lastReceipt.date}</div>
+              <div>CASHIER: {lastReceipt.cashier}</div>
+              <div>CUSTOMER: {lastReceipt.customer}</div>
+              <div style={{ borderBottom: "1px dashed #000", margin: "4px 0" }}></div>
+              {lastReceipt.cart.map((item, idx) => (
+                <div key={idx} style={{ display: "flex", justifyContent: "space-between", margin: "2px 0" }}>
+                  <span>{item.name.slice(0, 16)} x{item.qty}</span>
+                  <span>{money(item.qty * item.price)}</span>
+                </div>
+              ))}
+              <div style={{ borderBottom: "1px dashed #000", margin: "4px 0" }}></div>
+              <div style={{ display: "flex", justifyContent: "space-between", fontWeight: "bold" }}>
+                <span>TOTAL:</span>
+                <span>KES {money(lastReceipt.total)}</span>
+              </div>
+              <div style={{ display: "flex", justifyContent: "space-between" }}>
+                <span>PAID:</span>
+                <span>KES {money(lastReceipt.tendered)}</span>
+              </div>
+              <div style={{ display: "flex", justifyContent: "space-between" }}>
+                <span>CHANGE:</span>
+                <span>KES {money(lastReceipt.change)}</span>
+              </div>
+              <div style={{ textAlign: "center", marginTop: 8, fontSize: 8 }}>
+                * MAHADSANID / THANK YOU *
+              </div>
+            </div>
+          ) : printFormat === "dispatch" ? (
+            <div className="invoice-a4" style={{ padding: "10mm" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", borderBottom: "2px solid #000", paddingBottom: 8, marginBottom: 12 }}>
+                <div>
+                  <h2 style={{ margin: 0 }}>WAREHOUSE PICK & DISPATCH SLIP</h2>
+                  <div>Order Reference: #{lastReceipt.id} | Station: {lastReceipt.station}</div>
+                </div>
+                <div style={{ textAlign: "right" }}>
+                  <div>Date: {lastReceipt.date}</div>
+                  <div>Customer: {lastReceipt.customer}</div>
+                </div>
+              </div>
+              <table style={{ width: "100%", borderCollapse: "collapse", marginBottom: 16 }}>
                 <thead>
-                  <tr style={{ borderBottom: "1px solid rgba(255,255,255,0.12)", color: "#94a3b8" }}>
-                    <th style={{ textAlign: "left", paddingBottom: 10 }}>Product</th>
-                    <th style={{ textAlign: "right", paddingBottom: 10 }}>Qty</th>
-                    <th style={{ textAlign: "right", paddingBottom: 10 }}>Unit Price</th>
-                    <th style={{ textAlign: "right", paddingBottom: 10 }}>Line Total</th>
-                    <th></th>
+                  <tr style={{ background: "#eee", textAlign: "left" }}>
+                    <th style={{ padding: 6, border: "1px solid #ccc" }}>CHECK</th>
+                    <th style={{ padding: 6, border: "1px solid #ccc" }}>ITEM DESCRIPTION</th>
+                    <th style={{ padding: 6, border: "1px solid #ccc" }}>SKU</th>
+                    <th style={{ padding: 6, border: "1px solid #ccc", textAlign: "right" }}>QTY REQUIRED</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {cart.map((line) => (
-                    <tr key={line.product_id} style={{ borderBottom: "1px solid rgba(255,255,255,0.06)" }}>
-                      <td style={{ padding: "10px 0" }}>
-                        <strong style={{ color: "#ffffff" }}>{line.name}</strong>
-                      </td>
-                      <td style={{ textAlign: "right", whiteSpace: "nowrap", padding: "10px 0" }}>
-                        <div style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
-                          <button
-                            type="button"
-                            className="touch-btn"
-                            style={styles.touchStepBtn}
-                            onClick={() => updateCartQty(line.product_id, -1)}
-                          >
-                            -
-                          </button>
-                          <span style={{ minWidth: 28, textAlign: "center", fontWeight: 800, color: "#ffffff" }}>
-                            {line.qty}
-                          </span>
-                          <button
-                            type="button"
-                            className="touch-btn"
-                            style={styles.touchStepBtn}
-                            onClick={() => updateCartQty(line.product_id, 1)}
-                          >
-                            +
-                          </button>
-                          <span style={{ color: "#94a3b8", fontSize: 12 }}>{line.unit}</span>
-                        </div>
-                      </td>
-                      <td style={{ textAlign: "right", padding: "10px 8px", color: "#cbd5e1" }}>KES {money(line.price)}</td>
-                      <td style={{ textAlign: "right", fontWeight: 700, padding: "10px 8px", color: "#2dd4bf" }}>
-                        KES {money(line.qty * line.price)}
-                      </td>
-                      <td style={{ textAlign: "right", padding: "10px 0" }}>
-                        <button
-                          style={styles.btnDangerSmall}
-                          className="touch-btn"
-                          onClick={() => removeFromCart(line.product_id)}
-                        >
-                          ✕
-                        </button>
-                      </td>
+                  {lastReceipt.cart.map((item, idx) => (
+                    <tr key={idx}>
+                      <td style={{ padding: 6, border: "1px solid #ccc", textAlign: "center" }}>[  ]</td>
+                      <td style={{ padding: 6, border: "1px solid #ccc", fontWeight: "bold" }}>{item.name}</td>
+                      <td style={{ padding: 6, border: "1px solid #ccc" }}>{item.sku || `PRD-${item.product_id}`}</td>
+                      <td style={{ padding: 6, border: "1px solid #ccc", textAlign: "right", fontWeight: "bold" }}>{item.qty} {item.unit || "unit"}</td>
                     </tr>
                   ))}
                 </tbody>
               </table>
-            </div>
-
-            <div style={styles.cartFooter}>
-              <div style={{ fontSize: 18, fontWeight: 700 }}>
-                Total: KES {money(totalAmount)}
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 20, marginTop: 20, paddingTop: 10, borderTop: "1px dashed #000" }}>
+                <div>Storekeeper Sign: _____________________</div>
+                <div>Driver / Loading Sign: _________________</div>
               </div>
-              <button style={styles.btnPrimary} onClick={handleCheckout}>
-                Complete Sale (KES {money(totalAmount)})
-              </button>
             </div>
-          </div>
-        )}
-      </div>
+          ) : printFormat === "labels" ? (
+            <div className="labels-sheet">
+              {lastReceipt.cart.map((item, idx) => (
+                <div key={idx} style={{ border: "1.5px solid #000", padding: 8, borderRadius: 4, textAlign: "center" }}>
+                  <div style={{ fontWeight: "bold", fontSize: 11 }}>{item.name}</div>
+                  <div style={{ fontSize: 9 }}>SKU: {item.sku || `SKU-${item.product_id}`}</div>
+                  <div style={{ fontSize: 16, fontWeight: "bold", margin: "4px 0" }}>KES {money(item.price)}</div>
+                  <div style={{ fontSize: 10, letterSpacing: 2 }}>|||| ||| |||| | ||</div>
+                  <div style={{ fontSize: 8 }}>EXP: 2027-06-30</div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            /* 80mm Standard Thermal Receipt (Default) */
+            <div className="receipt-80mm">
+              <div style={{ textAlign: "center", marginBottom: 8 }}>
+                <div style={{ fontWeight: "bold", fontSize: 15 }}>iCash Wholesale & Flow</div>
+                <div>Bakaara Market / Nairobi Gate 4</div>
+                <div>Tel: +252 61 5000111 / +254 700 000000</div>
+                <div>PIN/VAT: P051289304Z</div>
+                <div style={{ borderBottom: "1px dashed #000", margin: "5px 0" }}></div>
+                <div style={{ fontWeight: "bold" }}>TAX INVOICE / RECEIPT #{lastReceipt.id}</div>
+                <div>Date: {lastReceipt.date}</div>
+                <div>Station: {lastReceipt.station}</div>
+                <div>Cashier: {lastReceipt.cashier}</div>
+                <div>Customer: {lastReceipt.customer}</div>
+                <div style={{ borderBottom: "1px dashed #000", margin: "5px 0" }}></div>
+              </div>
 
-      {/* Last Receipt Print Preview */}
-      {lastReceipt && (
-        <div style={{ ...styles.card, marginTop: 14, border: "2px solid #0d9488" }}>
-          <div style={styles.row}>
-            <div>
-              <strong>Receipt #{lastReceipt.id} Completed</strong>
-              <div style={styles.metaText}>{lastReceipt.date}</div>
+              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11 }}>
+                <thead>
+                  <tr style={{ borderBottom: "1px solid #000", textAlign: "left" }}>
+                    <th>ITEM</th>
+                    <th style={{ textAlign: "center" }}>QTY</th>
+                    <th style={{ textAlign: "right" }}>PRICE</th>
+                    <th style={{ textAlign: "right" }}>AMT</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {lastReceipt.cart.map((item, idx) => (
+                    <tr key={idx}>
+                      <td style={{ padding: "3px 0" }}>{item.name}</td>
+                      <td style={{ textAlign: "center" }}>{item.qty}</td>
+                      <td style={{ textAlign: "right" }}>{money(item.price)}</td>
+                      <td style={{ textAlign: "right" }}>{money(item.qty * item.price)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+
+              <div style={{ borderBottom: "1px dashed #000", margin: "6px 0" }}></div>
+
+              <div style={{ fontSize: 11 }}>
+                <div style={{ display: "flex", justifyContent: "space-between" }}>
+                  <span>SUBTOTAL:</span>
+                  <span>KES {money(lastReceipt.total * 0.95)}</span>
+                </div>
+                <div style={{ display: "flex", justifyContent: "space-between" }}>
+                  <span>VAT (5%):</span>
+                  <span>KES {money(lastReceipt.total * 0.05)}</span>
+                </div>
+                <div style={{ display: "flex", justifyContent: "space-between", fontWeight: "bold", fontSize: 13, margin: "3px 0" }}>
+                  <span>TOTAL:</span>
+                  <span>KES {money(lastReceipt.total)}</span>
+                </div>
+                <div style={{ display: "flex", justifyContent: "space-between" }}>
+                  <span>PAID ({lastReceipt.method.toUpperCase()}):</span>
+                  <span>KES {money(lastReceipt.tendered)}</span>
+                </div>
+                <div style={{ display: "flex", justifyContent: "space-between", fontWeight: "bold" }}>
+                  <span>CHANGE:</span>
+                  <span>KES {money(lastReceipt.change)}</span>
+                </div>
+              </div>
+
+              <div style={{ borderBottom: "1px dashed #000", margin: "6px 0" }}></div>
+
+              <div style={{ textAlign: "center", fontSize: 9, marginTop: 4 }}>
+                <div style={{ letterSpacing: 3, fontWeight: "bold", fontSize: 13 }}>||||| | |||| || |||||| | ||||</div>
+                <div>*ICASH-{lastReceipt.id}-{Date.now().toString().slice(-4)}*</div>
+                <div style={{ marginTop: 4 }}>Mahadsanid / Thank you for your business!</div>
+                <div>Goods once sold are not returnable after 48h.</div>
+              </div>
             </div>
-            <button style={styles.btnGhost} onClick={() => window.print()}>
-              Print Receipt
-            </button>
-          </div>
-          <div style={{ marginTop: 10, fontSize: 14 }}>
-            <div>Method: {lastReceipt.method.toUpperCase()}</div>
-            {lastReceipt.reference && <div>Ref: {lastReceipt.reference}</div>}
-            <div style={{ fontWeight: 700, marginTop: 4 }}>
-              Total Paid: KES {money(lastReceipt.total)}
-            </div>
-          </div>
+          )}
         </div>
       )}
     </div>
