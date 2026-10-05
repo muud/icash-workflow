@@ -1,6 +1,6 @@
 "use client";
 import { useEffect, useState, useMemo } from "react";
-import { api, getStoredToken, setStoredToken } from "../lib/api";
+import { api, getStoredToken, setStoredToken, enableDemoMode, disableDemoMode, isDemoMode } from "../lib/api";
 import { TEMPLATES } from "../lib/templates";
 import { translations } from "../lib/i18n";
 
@@ -66,6 +66,7 @@ export default function Page() {
 
   const handleLogout = () => {
     setStoredToken(null);
+    disableDemoMode();
     setUser(null);
     flash(lang === "so" ? "Waad ka baxday nidaamka." : "Signed out successfully.");
   };
@@ -102,6 +103,54 @@ export default function Page() {
       {notice && (
         <div style={{ ...styles.toast, background: notice.isError ? "rgba(239, 68, 68, 0.9)" : "rgba(13, 148, 136, 0.9)" }}>
           {notice.msg}
+        </div>
+      )}
+
+      {isDemoMode() && (
+        <div
+          style={{
+            background: "rgba(245, 158, 11, 0.16)",
+            border: "1px solid rgba(245, 158, 11, 0.45)",
+            backdropFilter: "blur(12px)",
+            borderRadius: 12,
+            padding: "10px 18px",
+            marginBottom: 16,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            flexWrap: "wrap",
+            gap: 10,
+            color: "#fef3c7",
+            fontSize: 13,
+            boxShadow: "0 4px 20px rgba(0, 0, 0, 0.2)",
+          }}
+        >
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <span style={{ fontSize: 16 }}>⚡</span>
+            <span>
+              <strong>{lang === "so" ? "QAABKA TIJAABADA (DEMO MODE):" : "PREVIEW DEMO MODE:"}</strong>{" "}
+              {lang === "so"
+                ? "Dhammaan POS-ka, Iibka, Alaabta FEFO iyo Oggolaanshaha waxay ku shaqeynayaan xog tijaabo ah bilaa server."
+                : "POS till, wholesale catalog, FEFO batches and approvals are running in interactive preview mode without needing a cloud server."}
+            </span>
+          </div>
+          <button
+            type="button"
+            className="touch-btn"
+            onClick={handleLogout}
+            style={{
+              background: "rgba(245, 158, 11, 0.3)",
+              border: "1px solid rgba(245, 158, 11, 0.6)",
+              color: "#ffffff",
+              borderRadius: 8,
+              padding: "5px 12px",
+              fontSize: 12,
+              fontWeight: 800,
+              cursor: "pointer",
+            }}
+          >
+            {lang === "so" ? "Ka Bax Tijaabada" : "Exit Preview"}
+          </button>
         </div>
       )}
 
@@ -224,18 +273,28 @@ function AuthScreen({ onLoginSuccess, flash, notice, t, lang, toggleLang }) {
   const [tenantName, setTenantName] = useState("");
   const [fullName, setFullName] = useState("");
   const [busy, setBusy] = useState(false);
+  const [backendOffline, setBackendOffline] = useState(false);
+
+  const isVercelHost = typeof window !== "undefined" && window.location.hostname.includes("vercel.app");
+
+  const enterDemo = async () => {
+    enableDemoMode();
+    flash(lang === "so" ? "Waxaad gashay 'Demo Mode' (Tijaabo Toos ah)! Dhammaan shaashadaha waa furan yihiin." : "Entered Instant Demo Mode! All features active.");
+    await onLoginSuccess();
+  };
 
   const fillDemo = () => {
     setIsRegister(false);
     setEmail("testadmin@acme.co.ke");
     setPassword("password123");
-    flash(lang === "so" ? "Xogtii Demo Admin waa la shubay! Guji 'Gal Nidaamka'." : "Demo Admin credentials loaded! Click Sign In.");
+    flash(lang === "so" ? "Xogtii Demo Admin waa la shubay! Guji 'Gal Nidaamka' ama 'Gal Demo Mode'." : "Demo Admin credentials loaded! Click Sign In or Launch Demo.");
   };
 
   const handleSubmit = async (e) => {
     e.preventDefault();
     if (!email || !password) return flash(lang === "so" ? "Fadlan geli email-ka iyo furaha sirta." : "Please fill in email and password.", true);
     setBusy(true);
+    setBackendOffline(false);
     try {
       let res;
       if (isRegister) {
@@ -253,6 +312,9 @@ function AuthScreen({ onLoginSuccess, flash, notice, t, lang, toggleLang }) {
       await onLoginSuccess();
     } catch (err) {
       flash(err.message, true);
+      if (err.message && (err.message.includes("offline") || err.message.includes("Backend") || isVercelHost)) {
+        setBackendOffline(true);
+      }
     } finally {
       setBusy(false);
     }
@@ -483,6 +545,58 @@ function AuthScreen({ onLoginSuccess, flash, notice, t, lang, toggleLang }) {
                 : t("onboardSubtitleLogin")}
             </div>
           </div>
+
+          {/* 1-Click Instant Demo Button */}
+          <button
+            type="button"
+            className="touch-btn"
+            onClick={enterDemo}
+            style={{
+              width: "100%",
+              padding: "12px 16px",
+              borderRadius: 12,
+              background: "linear-gradient(135deg, rgba(20, 184, 166, 0.3) 0%, rgba(13, 148, 136, 0.5) 100%)",
+              border: "1px solid rgba(45, 212, 191, 0.6)",
+              color: "#2dd4bf",
+              fontSize: 13,
+              fontWeight: 800,
+              cursor: "pointer",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              gap: 8,
+              marginBottom: 16,
+              boxShadow: "0 0 18px rgba(45, 212, 191, 0.2)",
+            }}
+          >
+            <span style={{ fontSize: 16 }}>⚡</span>
+            <span>{lang === "so" ? "Gal 'Demo Mode' Hadda (Tijaabo Bilaa Server)" : "Launch Instant Demo Mode (No Server Needed)"}</span>
+          </button>
+
+          {(backendOffline || isVercelHost) && (
+            <div
+              style={{
+                background: "rgba(245, 158, 11, 0.14)",
+                border: "1px solid rgba(245, 158, 11, 0.45)",
+                borderRadius: 12,
+                padding: "12px 14px",
+                marginBottom: 16,
+                fontSize: 12,
+                lineHeight: 1.5,
+                color: "#fef3c7",
+              }}
+            >
+              <div style={{ fontWeight: 800, color: "#fbbf24", display: "flex", alignItems: "center", gap: 6, marginBottom: 4 }}>
+                <span>⚠️</span>
+                <span>{lang === "so" ? "Xogta Server-ka (Vercel Cloud vs Local):" : "Server Notice (Vercel Cloud vs Local):"}</span>
+              </div>
+              <div>
+                {lang === "so"
+                  ? "Vercel wuxuu hayaa qeybta hore (Frontend). Backend-ka Python (FastAPI) wuxuu ku dhex shaqeeyaa kombuyuutarkaaga (127.0.0.1:8000), Vercel-na toos uma gaari karo. Riix badhanka kore ee 'Gal Demo Mode Hadda ⚡' si aad u gasho adigoon server u baahnayn."
+                  : "Vercel hosts the frontend. The Python FastAPI backend runs on your local machine (127.0.0.1:8000). Click 'Launch Instant Demo Mode ⚡' above to test immediately without a cloud backend."}
+              </div>
+            </div>
+          )}
 
           <form onSubmit={handleSubmit}>
             {isRegister && (
